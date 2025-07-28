@@ -1,7 +1,8 @@
 services:
   - type: worker
-    name: fuel-vouch-bot
+    name: Fuel-Vouch-Bot
     env: python
+    plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python bot.py"
     pythonVersion: 3.11.9
