@@ -1,8 +1,6 @@
 services:
   - type: worker
     name: Fuel-Vouch-Bot
-    env: python
+    env: docker
     plan: starter
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
-    pythonVersion: 3.11.9
+    dockerfilePath: ./Dockerfile
