@@ -58,18 +58,12 @@ def get_points(user_id: int) -> int:
 
 # ---- helpers ----
 def is_image(attachment: discord.Attachment) -> bool:
-    # Prefer reliable MIME check over extension
     if attachment.content_type and attachment.content_type.startswith("image/"):
         return True
-    # fallback to extension
     name = attachment.filename.lower()
     return name.endswith((".png", ".jpg", ".jpeg", ".webp"))
 
 def overlay_logo(img_bytes: bytes) -> BytesIO | None:
-    """
-    Center a large semi-transparent watermark.
-    Uses logo.png if present, otherwise draws FuelCart text.
-    """
     try:
         base = Image.open(BytesIO(img_bytes)).convert("RGBA")
     except UnidentifiedImageError:
@@ -84,20 +78,15 @@ def overlay_logo(img_bytes: bytes) -> BytesIO | None:
     try:
         if os.path.exists(LOGO_PATH):
             logo = Image.open(LOGO_PATH).convert("RGBA")
-            # ~35% of the width
             target_w = int(bw * 0.35)
             ratio = target_w / logo.width
             logo = logo.resize((target_w, int(logo.height * ratio)), Image.LANCZOS)
-
-            # semi-transparent
             alpha = logo.split()[3].point(lambda p: int(p * 0.35))
             logo.putalpha(alpha)
-
             x = (bw - logo.width) // 2
             y = (bh - logo.height) // 2
             base.paste(logo, (x, y), logo)
         else:
-            # Text fallback
             txt_layer = Image.new("RGBA", base.size, (255, 255, 255, 0))
             draw = ImageDraw.Draw(txt_layer)
             try:
@@ -151,14 +140,13 @@ async def on_message(message: discord.Message):
 
                 if watermarked:
                     await message.channel.send(file=discord.File(watermarked, filename="fuelcart_watermarked.png"))
-            try:
-                    await message.delete()
-            except discord.NotFound:
-                    log.warning("Tried to delete a message that was already gone.")
+                    try:
+                        await message.delete()
+                    except discord.NotFound:
+                        log.warning("Tried to delete a message that was already gone.")
                     total = add_points(message.author.id, POINTS_PER_IMAGE)
                     await message.channel.send(
-                    f"🎉 {message.author.mention} earned **{POINTS_PER_IMAGE}** point! Total: **{total}**"
-)
+                        f"🎉 {message.author.mention} earned **{POINTS_PER_IMAGE}** point! Total: **{total}**")
                     processed = True
                 else:
                     log.warning("Watermark returned None for %s", att.filename)
@@ -183,6 +171,7 @@ async def points_cmd(ctx: commands.Context, member: discord.Member | None = None
 async def addpoints_cmd(ctx: commands.Context, member: discord.Member, amount: int):
     total = add_points(member.id, amount)
     await ctx.send(f"✅ Added **{amount}** to {member.mention}. Total: **{total}**")
+
 @bot.command(name="resetpoints")
 @commands.has_permissions(administrator=True)
 async def resetpoints_cmd(ctx: commands.Context):
