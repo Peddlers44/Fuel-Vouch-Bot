@@ -146,7 +146,8 @@ async def on_message(message: discord.Message):
                         log.warning("Tried to delete a message that was already gone.")
                     total = add_points(message.author.id, POINTS_PER_IMAGE)
                     await message.channel.send(
-                        f"🎉 {message.author.mention} earned **{POINTS_PER_IMAGE}** point! Total: **{total}**")
+                        f"🎉 {message.author.mention} earned **{POINTS_PER_IMAGE}** point! Total: **{total}**"
+                    )
                     processed = True
                 else:
                     log.warning("Watermark returned None for %s", att.filename)
