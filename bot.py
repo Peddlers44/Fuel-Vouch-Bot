@@ -151,7 +151,10 @@ async def on_message(message: discord.Message):
 
                 if watermarked:
                     await message.channel.send(file=discord.File(watermarked, filename="fuelcart_watermarked.png"))
+                    try:
                     await message.delete()
+            except discord.NotFound:
+                    log.warning("Tried to delete a message that was already gone.")
                     total = add_points(message.author.id, POINTS_PER_IMAGE)
                     await message.channel.send(
                     f"🎉 {message.author.mention} earned **{POINTS_PER_IMAGE}** point! Total: **{total}**"
