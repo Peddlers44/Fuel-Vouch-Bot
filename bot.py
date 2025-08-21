@@ -294,7 +294,7 @@ class VouchView(discord.ui.View):
                 await target_channel.send(f"❌ A {SERVER_NAME} vouch submission for <@{self.member_id}> was rejected.")
 
             await interaction.message.edit(
-                content=f"❌ **Rejected by {interaction.user.mention)}** for <@{self.member_id}>.",
+                content=f"❌ **Rejected by {interaction.user.mention}** for <@{self.member_id}>.",
                 embed=None,
                 view=None
             )
