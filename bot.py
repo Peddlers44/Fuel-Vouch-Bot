@@ -1,21 +1,18 @@
-# bot.py — Fuel Cart Vouch Bot (SQLite version)
-# Files needed in the folder: bot.py, logo.png
-# points.db will be created automatically on first run.
+# bot.py — Fuel Cart Vouch Bot (PostgreSQL, per-guild points)
 
 import os
-import io
-import json
-import sqlite3
 from typing import Optional
 
 import discord
 from discord.ext import commands
 from PIL import Image
 
-# === BASIC CONFIG (edit these) ===
+import psycopg2
+
+# === BASIC CONFIG ===
 SERVER_NAME = "Fuel Cart"
 
-# Discord IDs (update these to your server)
+# Discord IDs
 GUILD_ID = 1399270717807394937
 TARGET_CHANNEL_ID = 1399270718247796744   # where users post vouches (images)
 REVIEW_CHANNEL_ID = 1405065253129027584   # where staff review/verify/reject
@@ -23,86 +20,144 @@ ADMIN_USER_ID = 1403410639694598176
 ALLOWED_ROLE_ID = 1399270717832429581
 OWNER_ID = 1403411205330046987
 
-# Files (keep these file names so your folder matches the screenshot)
+# Files
 LOGO_PATH = "logo.png"
-POINTS_DB_PATH = "points.db"
 
-# Bot token: set env var BOT_TOKEN or paste a literal string here (not recommended)
+# === ENV VARS ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Render Postgres → External Database URL
+
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN env var")
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL env var")
+
+# === POSTGRES (per-guild points) ===
+PER_GUILD = True  # set False to make points global across all servers
+
+pg_conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+pg_conn.autocommit = True
+
+def init_db():
+    with pg_conn.cursor() as cur:
+        if PER_GUILD:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS points (
+                guild_id   BIGINT NOT NULL,
+                user_id    BIGINT NOT NULL,
+                points     INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, user_id)
+            );
+            """)
+        else:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS points (
+                user_id    BIGINT PRIMARY KEY,
+                points     INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """)
+
+def _keys_for_insert(user_id: int, guild_id: Optional[int]):
+    return (guild_id, user_id) if PER_GUILD else (user_id,)
+
+def get_points(user_id: int, guild_id: Optional[int] = None) -> int:
+    with pg_conn.cursor() as cur:
+        if PER_GUILD:
+            if guild_id is None:
+                raise ValueError("guild_id is required when PER_GUILD=True")
+            cur.execute("SELECT points FROM points WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
+        else:
+            cur.execute("SELECT points FROM points WHERE user_id=%s;", (user_id,))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+def add_points(user_id: int, amount: int, guild_id: Optional[int] = None) -> int:
+    with pg_conn.cursor() as cur:
+        if PER_GUILD:
+            if guild_id is None:
+                raise ValueError("guild_id is required when PER_GUILD=True")
+            cur.execute("""
+                INSERT INTO points (guild_id, user_id, points)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET points = points.points + EXCLUDED.points,
+                              updated_at = NOW()
+                RETURNING points;
+            """, (guild_id, user_id, amount))
+        else:
+            cur.execute("""
+                INSERT INTO points (user_id, points)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET points = points.points + EXCLUDED.points,
+                              updated_at = NOW()
+                RETURNING points;
+            """, (user_id, amount))
+        return int(cur.fetchone()[0])
+
+def remove_points(user_id: int, amount: int, guild_id: Optional[int] = None) -> int:
+    current = get_points(user_id, guild_id)
+    new_total = max(0, current - amount)
+    with pg_conn.cursor() as cur:
+        if PER_GUILD:
+            if guild_id is None:
+                raise ValueError("guild_id is required when PER_GUILD=True")
+            cur.execute("""
+                INSERT INTO points (guild_id, user_id, points)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET points = EXCLUDED.points,
+                              updated_at = NOW()
+                RETURNING points;
+            """, (guild_id, user_id, new_total))
+        else:
+            cur.execute("""
+                INSERT INTO points (user_id, points)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET points = EXCLUDED.points,
+                              updated_at = NOW()
+                RETURNING points;
+            """, (user_id, new_total))
+        return int(cur.fetchone()[0])
+
+def reset_points(user_id: int, guild_id: Optional[int] = None) -> None:
+    with pg_conn.cursor() as cur:
+        if PER_GUILD:
+            if guild_id is None:
+                raise ValueError("guild_id is required when PER_GUILD=True")
+            cur.execute("""
+                INSERT INTO points (guild_id, user_id, points)
+                VALUES (%s, %s, 0)
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET points = 0,
+                              updated_at = NOW();
+            """, (guild_id, user_id))
+        else:
+            cur.execute("""
+                INSERT INTO points (user_id, points)
+                VALUES (%s, 0)
+                ON CONFLICT (user_id)
+                DO UPDATE SET points = 0,
+                              updated_at = NOW();
+            """, (user_id,))
 
 # === BOT SETUP ===
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
-
-# Ensure temp dir exists
 os.makedirs("temp", exist_ok=True)
-
-# === POINTS STORAGE: SQLite (points.db) ===
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(POINTS_DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS points(
-            user_id INTEGER PRIMARY KEY,
-            points  INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    return conn
-
-def get_points(user_id: int) -> int:
-    conn = db()
-    cur = conn.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-def add_points(user_id: int, amount: int) -> int:
-    conn = db()
-    with conn:
-        conn.execute("""
-            INSERT INTO points(user_id, points)
-            VALUES(?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET points = points + excluded.points
-        """, (user_id, amount))
-        cur = conn.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
-        total = cur.fetchone()[0]
-    conn.close()
-    return total
-
-def remove_points(user_id: int, amount: int) -> int:
-    conn = db()
-    with conn:
-        cur = conn.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        current = row[0] if row else 0
-        new_total = max(0, current - amount)
-        conn.execute("""
-            INSERT INTO points(user_id, points) VALUES(?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET points = ?
-        """, (user_id, new_total, new_total))
-    conn.close()
-    return new_total
-
-def reset_points(user_id: int) -> None:
-    conn = db()
-    with conn:
-        conn.execute("""
-            INSERT INTO points(user_id, points) VALUES(?, 0)
-            ON CONFLICT(user_id) DO UPDATE SET points = 0
-        """, (user_id,))
-    conn.close()
 
 # === IMAGE PROCESSING ===
 def overlay_logo(user_image_path: str, logo_path: str, output_path: str) -> bool:
     try:
         base = Image.open(user_image_path).convert("RGBA")
         logo = Image.open(logo_path).convert("RGBA")
-
-        # Resize logo to ~25% of base width
         logo_width = max(1, base.width // 4)
         logo_height = int(logo.height * (logo_width / logo.width))
         logo = logo.resize((logo_width, logo_height), Image.Resampling.LANCZOS)
-
         pos = ((base.width - logo.width) // 2, (base.height - logo.height) // 2)
         combined = base.copy()
         combined.paste(logo, pos, logo)
@@ -112,7 +167,7 @@ def overlay_logo(user_image_path: str, logo_path: str, output_path: str) -> bool
         print(f"[overlay_logo] Error: {e}")
         return False
 
-# === REVIEW VIEW (Verify / Reject) ===
+# === REVIEW VIEW ===
 class VouchView(discord.ui.View):
     def __init__(self, member_id: int, vouch_text: str, image_path: str):
         super().__init__(timeout=None)
@@ -137,7 +192,7 @@ class VouchView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            total = add_points(self.member_id, 1)
+            total = add_points(self.member_id, 1, guild_id=interaction.guild.id if PER_GUILD else None)
             member = await interaction.guild.fetch_member(self.member_id)
             member_display = member.display_name
 
@@ -202,15 +257,13 @@ class VouchView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} is online and ready!")
-    # Ensure DB exists
-    db().close()
+    init_db()
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Vouch posts only in TARGET_CHANNEL_ID: must include an image
     is_vouch_submission = (
         message.channel.id == TARGET_CHANNEL_ID and
         message.attachments and
@@ -260,7 +313,7 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-        return  # stop here so it doesn't get treated as a command
+        return
 
     await bot.process_commands(message)
 
@@ -268,33 +321,33 @@ async def on_message(message: discord.Message):
 @bot.command(name="addpoints")
 @commands.has_permissions(administrator=True)
 async def cmd_addpoints(ctx, member: discord.Member, points: int):
-    total = add_points(member.id, points)
+    total = add_points(member.id, points, guild_id=ctx.guild.id if PER_GUILD else None)
     await ctx.send(f"Added {points} points to {member.mention}. They now have {total} points.")
 
 @bot.command(name="removepoints")
 @commands.has_permissions(administrator=True)
 async def cmd_removepoints(ctx, member: discord.Member, points: int):
-    total = remove_points(member.id, points)
+    total = remove_points(member.id, points, guild_id=ctx.guild.id if PER_GUILD else None)
     await ctx.send(f"Removed {points} points from {member.mention}. They now have {total} points.")
 
 @bot.command(name="points")
 async def cmd_points(ctx, member: Optional[discord.Member] = None):
     member = member or ctx.author
-    total = get_points(member.id)
+    total = get_points(member.id, guild_id=ctx.guild.id if PER_GUILD else None)
     await ctx.send(f"{member.mention} has {total} point{'s' if total != 1 else ''}.")
 
 @bot.command(name="resetpoints")
 @commands.has_permissions(administrator=True)
 async def cmd_resetpoints(ctx, member: discord.Member):
-    reset_points(member.id)
+    reset_points(member.id, guild_id=ctx.guild.id if PER_GUILD else None)
     await ctx.send(f"{member.mention}'s points have been reset.")
 
 @bot.command(name="redeem")
 @commands.has_permissions(administrator=True)
 async def cmd_redeem(ctx, user: discord.Member):
-    total = get_points(user.id)
+    total = get_points(user.id, guild_id=ctx.guild.id if PER_GUILD else None)
     if total > 0:
-        reset_points(user.id)
+        reset_points(user.id, guild_id=ctx.guild.id if PER_GUILD else None)
         await ctx.send(f"{user.mention}'s points have been reset for their reward.")
     else:
         await ctx.send(f"{user.mention} has no points to redeem.")
@@ -314,6 +367,4 @@ async def on_command_error(ctx, error):
         print(f"[on_command_error] in '{getattr(ctx, 'command', None)}': {error}")
 
 # === RUN ===
-if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
-    raise RuntimeError("Set your Discord bot token in the BOT_TOKEN env var or replace the placeholder in the code.")
 bot.run(BOT_TOKEN)
