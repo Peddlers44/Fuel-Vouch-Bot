@@ -1,4 +1,4 @@
-# bot.py — Fuel Cart Vouch Bot (PostgreSQL, per-guild points)
+# bot.py — Fuel Cart Vouch Bot (PostgreSQL with auto-migration)
 
 import os
 from typing import Optional
@@ -6,40 +6,42 @@ from typing import Optional
 import discord
 from discord.ext import commands
 from PIL import Image
-
 import psycopg2
 
-# === BASIC CONFIG ===
+# ========== CONFIG ==========
 SERVER_NAME = "Fuel Cart"
 
-# Discord IDs
+# Discord IDs (for THIS server)
 GUILD_ID = 1399270717807394937
-TARGET_CHANNEL_ID = 1399270718247796744   # where users post vouches (images)
-REVIEW_CHANNEL_ID = 1405065253129027584   # where staff review/verify/reject
+TARGET_CHANNEL_ID = 1399270718247796744   # vouches channel (users post images)
+REVIEW_CHANNEL_ID = 1405065253129027584   # staff review channel
 ADMIN_USER_ID = 1403410639694598176
 ALLOWED_ROLE_ID = 1399270717832429581
 OWNER_ID = 1403411205330046987
 
-# Files
 LOGO_PATH = "logo.png"
 
-# === ENV VARS ===
+# ========== ENV VARS ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Render Postgres → External Database URL
+DATABASE_URL = os.getenv("DATABASE_URL")
+PER_GUILD = (os.getenv("PER_GUILD", "true").lower() in ("1", "true", "yes"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN env var")
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL env var")
 
-# === POSTGRES (per-guild points) ===
-PER_GUILD = True  # set False to make points global across all servers
-
+# ========== DB SETUP (auto-migrate) ==========
 pg_conn = psycopg2.connect(DATABASE_URL, sslmode="require")
 pg_conn.autocommit = True
 
 def init_db():
+    """
+    Ensure the 'points' table exists. If an old global schema exists, migrate it
+    to (guild_id, user_id) PK when PER_GUILD=True. Safe to run repeatedly.
+    """
     with pg_conn.cursor() as cur:
+        # Create table if missing (start with per-guild or global shape)
         if PER_GUILD:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS points (
@@ -50,7 +52,31 @@ def init_db():
                 PRIMARY KEY (guild_id, user_id)
             );
             """)
+            # If an old global table exists, it may lack columns/PK
+            # 1) ensure columns exist
+            cur.execute("ALTER TABLE points ADD COLUMN IF NOT EXISTS guild_id BIGINT;")
+            cur.execute("ALTER TABLE points ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+            # 2) if guild_id is NULL (from old rows), backfill with this bot's guild
+            cur.execute("UPDATE points SET guild_id=%s WHERE guild_id IS NULL;", (GUILD_ID,))
+            # 3) ensure PK is (guild_id, user_id)
+            # drop any existing PK and re-add
+            cur.execute("""
+            DO $$
+            DECLARE pkname text;
+            BEGIN
+              SELECT conname INTO pkname
+              FROM   pg_constraint c
+              JOIN   pg_class t ON t.oid = c.conrelid
+              WHERE  t.relname = 'points' AND c.contype = 'p'
+              LIMIT 1;
+              IF pkname IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE points DROP CONSTRAINT %I', pkname);
+              END IF;
+            END$$;
+            """)
+            cur.execute("ALTER TABLE points ADD PRIMARY KEY (guild_id, user_id);")
         else:
+            # Global points
             cur.execute("""
             CREATE TABLE IF NOT EXISTS points (
                 user_id    BIGINT PRIMARY KEY,
@@ -58,15 +84,37 @@ def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """)
-
-def _keys_for_insert(user_id: int, guild_id: Optional[int]):
-    return (guild_id, user_id) if PER_GUILD else (user_id,)
+            # If table was per-guild, collapse to global by summing points
+            # (only if there's a guild_id column)
+            cur.execute("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='points' AND column_name='guild_id';
+            """)
+            if cur.fetchone():
+                # Build a temp table with summed totals
+                cur.execute("""
+                CREATE TEMP TABLE _tmp_points AS
+                  SELECT user_id, SUM(points)::int AS points
+                  FROM points
+                  GROUP BY user_id;
+                """)
+                # Replace real table with global shape
+                cur.execute("DROP TABLE IF EXISTS points;")
+                cur.execute("""
+                CREATE TABLE points (
+                    user_id    BIGINT PRIMARY KEY,
+                    points     INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """)
+                cur.execute("""
+                INSERT INTO points (user_id, points) SELECT user_id, points FROM _tmp_points;
+                """)
 
 def get_points(user_id: int, guild_id: Optional[int] = None) -> int:
     with pg_conn.cursor() as cur:
         if PER_GUILD:
-            if guild_id is None:
-                raise ValueError("guild_id is required when PER_GUILD=True")
+            if guild_id is None: raise ValueError("guild_id required (PER_GUILD=True)")
             cur.execute("SELECT points FROM points WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
         else:
             cur.execute("SELECT points FROM points WHERE user_id=%s;", (user_id,))
@@ -76,8 +124,7 @@ def get_points(user_id: int, guild_id: Optional[int] = None) -> int:
 def add_points(user_id: int, amount: int, guild_id: Optional[int] = None) -> int:
     with pg_conn.cursor() as cur:
         if PER_GUILD:
-            if guild_id is None:
-                raise ValueError("guild_id is required when PER_GUILD=True")
+            if guild_id is None: raise ValueError("guild_id required (PER_GUILD=True)")
             cur.execute("""
                 INSERT INTO points (guild_id, user_id, points)
                 VALUES (%s, %s, %s)
@@ -98,12 +145,11 @@ def add_points(user_id: int, amount: int, guild_id: Optional[int] = None) -> int
         return int(cur.fetchone()[0])
 
 def remove_points(user_id: int, amount: int, guild_id: Optional[int] = None) -> int:
-    current = get_points(user_id, guild_id)
+    current = get_points(user_id, guild_id if PER_GUILD else None)
     new_total = max(0, current - amount)
     with pg_conn.cursor() as cur:
         if PER_GUILD:
-            if guild_id is None:
-                raise ValueError("guild_id is required when PER_GUILD=True")
+            if guild_id is None: raise ValueError("guild_id required (PER_GUILD=True)")
             cur.execute("""
                 INSERT INTO points (guild_id, user_id, points)
                 VALUES (%s, %s, %s)
@@ -126,8 +172,7 @@ def remove_points(user_id: int, amount: int, guild_id: Optional[int] = None) -> 
 def reset_points(user_id: int, guild_id: Optional[int] = None) -> None:
     with pg_conn.cursor() as cur:
         if PER_GUILD:
-            if guild_id is None:
-                raise ValueError("guild_id is required when PER_GUILD=True")
+            if guild_id is None: raise ValueError("guild_id required (PER_GUILD=True)")
             cur.execute("""
                 INSERT INTO points (guild_id, user_id, points)
                 VALUES (%s, %s, 0)
@@ -144,13 +189,21 @@ def reset_points(user_id: int, guild_id: Optional[int] = None) -> None:
                               updated_at = NOW();
             """, (user_id,))
 
-# === BOT SETUP ===
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="!", intents=intents)
+# ========== BOT ==========
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(
+    command_prefix=commands.when_mentioned_or("!"),
+    intents=intents,
+    case_insensitive=True,
+)
 bot.remove_command("help")
+
 os.makedirs("temp", exist_ok=True)
 
-# === IMAGE PROCESSING ===
+# ========== IMAGE ==========
 def overlay_logo(user_image_path: str, logo_path: str, output_path: str) -> bool:
     try:
         base = Image.open(user_image_path).convert("RGBA")
@@ -167,7 +220,7 @@ def overlay_logo(user_image_path: str, logo_path: str, output_path: str) -> bool
         print(f"[overlay_logo] Error: {e}")
         return False
 
-# === REVIEW VIEW ===
+# ========== REVIEW UI ==========
 class VouchView(discord.ui.View):
     def __init__(self, member_id: int, vouch_text: str, image_path: str):
         super().__init__(timeout=None)
@@ -241,7 +294,7 @@ class VouchView(discord.ui.View):
                 await target_channel.send(f"❌ A {SERVER_NAME} vouch submission for <@{self.member_id}> was rejected.")
 
             await interaction.message.edit(
-                content=f"❌ **Rejected by {interaction.user.mention}** for <@{self.member_id}>.",
+                content=f"❌ **Rejected by {interaction.user.mention)}** for <@{self.member_id}>.",
                 embed=None,
                 view=None
             )
@@ -253,11 +306,11 @@ class VouchView(discord.ui.View):
         finally:
             self._cleanup_local_file()
 
-# === EVENTS ===
+# ========== EVENTS ==========
 @bot.event
 async def on_ready():
-    print(f"✅ {bot.user} is online and ready!")
     init_db()
+    print(f"✅ {bot.user} ready | PER_GUILD={PER_GUILD} | message_content={bot.intents.message_content}")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -300,10 +353,8 @@ async def on_message(message: discord.Message):
             embed.set_image(url="attachment://processed.jpg")
 
             view = VouchView(member_id=message.author.id, vouch_text=vouch_text, image_path=out_img)
-
             await review_channel.send(embed=embed, file=discord.File(out_img, filename="processed.jpg"), view=view)
             await message.delete()
-
         except Exception as e:
             print(f"[on_message] {e}")
         finally:
@@ -312,12 +363,11 @@ async def on_message(message: discord.Message):
                     os.remove(user_img)
             except Exception:
                 pass
-
         return
 
     await bot.process_commands(message)
 
-# === COMMANDS ===
+# ========== COMMANDS ==========
 @bot.command(name="addpoints")
 @commands.has_permissions(administrator=True)
 async def cmd_addpoints(ctx, member: discord.Member, points: int):
@@ -352,19 +402,19 @@ async def cmd_redeem(ctx, user: discord.Member):
     else:
         await ctx.send(f"{user.mention} has no points to redeem.")
 
-# === ERROR HANDLER ===
+# Better error feedback
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing argument. Usage: `{ctx.prefix}{ctx.command.name} {ctx.command.signature}`")
-    elif isinstance(error, commands.MissingPermissions):
-        await ctx.send("You don't have the required permissions to run this command.")
-    elif isinstance(error, commands.MemberNotFound):
-        await ctx.send(f"Member not found.")
-    elif isinstance(error, commands.CommandNotFound):
-        pass
-    else:
-        print(f"[on_command_error] in '{getattr(ctx, 'command', None)}': {error}")
+    from discord.ext.commands import MissingRequiredArgument, MissingPermissions, MemberNotFound, CommandNotFound
+    if isinstance(error, MissingRequiredArgument):
+        return await ctx.send(f"Missing argument. Usage: `{ctx.prefix}{ctx.command.name} {ctx.command.signature}`")
+    if isinstance(error, MissingPermissions):
+        return await ctx.send("You need **Administrator** to run that command here.")
+    if isinstance(error, MemberNotFound):
+        return await ctx.send("Member not found.")
+    if isinstance(error, CommandNotFound):
+        return  # stay quiet on typos
+    print(f"[on_command_error] {type(error).__name__}: {error}")
 
-# === RUN ===
+# ========== RUN ==========
 bot.run(BOT_TOKEN)
